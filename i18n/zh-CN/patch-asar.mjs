@@ -175,6 +175,64 @@ const REGEX_PRECEDING_PUNCT = new Set([
   "=>",
 ]);
 
+// Property / class-field names that hold runtime discriminators or protocol IDs (NEVER translate)
+const BLOCKED_PROP_KEYS = new Set([
+  "_tag",
+  "_op",
+  "_id",
+  "op",
+  "tag",
+  "kind",
+  "type",
+  "status",
+  "driver",
+  "driverKind",
+  "mode",
+  "role",
+  "id",
+  "value",
+  "category",
+  "method",
+  "event",
+  "action",
+  "level",
+  "icon",
+  "expected",
+  "key",
+  "code",
+  "reason",
+  "provider",
+  "command",
+  "platform",
+  "arch",
+  "defaultValue",
+  "className",
+]);
+
+// Property names that explicitly carry human-facing UI text
+const UI_PROP_KEYS = new Set([
+  "children",
+  "title",
+  "label",
+  "description",
+  "placeholder",
+  "heading",
+  "emptyText",
+  "confirmLabel",
+  "cancelLabel",
+  "confirmText",
+  "cancelText",
+  "tooltip",
+  "aria-label",
+  "headline",
+  "subtitle",
+  "detail",
+  "summary",
+  "text",
+  "message",
+  "ctaLabel",
+]);
+
 function unescapeJsString(raw, quote) {
   let out = "";
   for (let i = 0; i < raw.length; i++) {
@@ -249,7 +307,6 @@ function unescapeJsString(raw, quote) {
         break;
       }
       default:
-        // Keep unknown single-char escape if safe, otherwise bail out
         if (esc === quote) out += quote;
         else out += esc;
         break;
@@ -305,17 +362,82 @@ function peekNextToken(code, pos) {
   return code[i];
 }
 
-function patchJsSource(code, dict) {
+function patchJsSource(code, dict, options = { mode: "client" }) {
   const n = code.length;
   let i = 0;
   let lastEmit = 0;
   const parts = [];
   let replacements = 0;
+
   let prevToken = "";
+  let prev2Token = "";
+  let prevStringVal = null;
+  let prev2StringVal = null;
+
+  // Track brace/paren/bracket nesting and current object property key per `{` scope
+  // stack items: { type: '{'|'('|'[', propKey: string|null, ternaryDepth: number }
+  const stack = [];
+
+  const currentScope = () => (stack.length > 0 ? stack[stack.length - 1] : null);
+  const currentPropKey = () => {
+    for (let k = stack.length - 1; k >= 0; k--) {
+      if (stack[k].type === "{") return stack[k].propKey;
+    }
+    return null;
+  };
+
+  const pushToken = (tok, strVal = null) => {
+    prev2Token = prevToken;
+    prevToken = tok;
+    prev2StringVal = prevStringVal;
+    prevStringVal = strVal;
+  };
 
   const isIdentStart = (c) =>
     (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || c === "_" || c === "$" || c.charCodeAt(0) >= 128;
   const isIdentPart = (c) => isIdentStart(c) || (c >= "0" && c <= "9");
+
+  const canTranslate = (decoded, nextToken) => {
+    if (
+      prevToken === "===" ||
+      prevToken === "!==" ||
+      prevToken === "==" ||
+      prevToken === "!=" ||
+      prevToken === "case" ||
+      prevToken === "import" ||
+      prevToken === "from" ||
+      nextToken === "===" ||
+      nextToken === "!==" ||
+      nextToken === "==" ||
+      nextToken === "!="
+    ) {
+      return false;
+    }
+
+    const isObjectKey = (prevToken === "{" || prevToken === ",") && nextToken === ":";
+    if (isObjectKey) return false;
+
+    const propKey = currentPropKey();
+
+    if (options.mode === "desktopMain") {
+      // In main.cjs only touch explicit Electron menu labels
+      return propKey === "label";
+    }
+
+    if (propKey !== null && BLOCKED_PROP_KEYS.has(propKey)) {
+      return false;
+    }
+
+    // Single-word tokens (no spaces) are prone to colliding with Effect ADT tags,
+    // log levels, or internal enum names. Require explicit UI property context or /settings route map.
+    const isSingleWord = !/\s/.test(decoded);
+    if (isSingleWord) {
+      const inUiProp = propKey !== null && (UI_PROP_KEYS.has(propKey) || propKey.startsWith("/settings"));
+      if (!inUiProp) return false;
+    }
+
+    return true;
+  };
 
   while (i < n) {
     const ch = code[i];
@@ -361,7 +483,7 @@ function patchJsSource(code, dict) {
         }
       }
       while (i < n && isIdentPart(code[i])) i++;
-      prevToken = "/";
+      pushToken("/");
       continue;
     }
 
@@ -387,20 +509,7 @@ function patchJsSource(code, dict) {
         const translated = translateStringValue(decoded, dict);
         if (translated !== null && translated !== decoded) {
           const nextToken = peekNextToken(code, i);
-          const isComparison =
-            prevToken === "===" ||
-            prevToken === "!==" ||
-            prevToken === "==" ||
-            prevToken === "!=" ||
-            prevToken === "case" ||
-            prevToken === "import" ||
-            prevToken === "from" ||
-            nextToken === "===" ||
-            nextToken === "!==" ||
-            nextToken === "==" ||
-            nextToken === "!=";
-          const isObjectKey = (prevToken === "{" || prevToken === ",") && nextToken === ":";
-          if (!isComparison && !isObjectKey) {
+          if (canTranslate(decoded, nextToken)) {
             parts.push(code.slice(lastEmit, start));
             parts.push(JSON.stringify(translated));
             lastEmit = i;
@@ -408,11 +517,11 @@ function patchJsSource(code, dict) {
           }
         }
       }
-      prevToken = "STRING";
+      pushToken("STRING", decoded);
       continue;
     }
 
-    // Template literals: `...` (only translate static templates without ${...})
+    // Template literals: `...`
     if (ch === "`") {
       const start = i;
       i++;
@@ -426,7 +535,6 @@ function patchJsSource(code, dict) {
           hasInterpolation = true;
           i += 2;
           depth = 1;
-          // Skip nested interpolation cleanly using simple brace/string scan
           while (i < n && depth > 0) {
             const ic = code[i];
             if (ic === "\\") i += 2;
@@ -440,9 +548,6 @@ function patchJsSource(code, dict) {
                   break;
                 } else i++;
               }
-            } else if (ic === "`") {
-              // nested template: just break out to avoid ambiguity
-              i++;
             } else if (ic === "{") {
               depth++;
               i++;
@@ -460,25 +565,15 @@ function patchJsSource(code, dict) {
           i++;
         }
       }
+      let decoded = null;
       if (!hasInterpolation) {
         const raw = code.slice(start + 1, i - 1);
-        const decoded = unescapeJsString(raw, "`");
+        decoded = unescapeJsString(raw, "`");
         if (decoded !== null) {
           const translated = translateStringValue(decoded, dict);
           if (translated !== null && translated !== decoded) {
             const nextToken = peekNextToken(code, i);
-            const isComparison =
-              prevToken === "===" ||
-              prevToken === "!==" ||
-              prevToken === "==" ||
-              prevToken === "!=" ||
-              prevToken === "case" ||
-              nextToken === "===" ||
-              nextToken === "!==" ||
-              nextToken === "==" ||
-              nextToken === "!=";
-            const isObjectKey = (prevToken === "{" || prevToken === ",") && nextToken === ":";
-            if (!isComparison && !isObjectKey) {
+            if (canTranslate(decoded, nextToken)) {
               parts.push(code.slice(lastEmit, start));
               parts.push(encodeTemplateLiteral(translated));
               lastEmit = i;
@@ -487,7 +582,7 @@ function patchJsSource(code, dict) {
           }
         }
       }
-      prevToken = "STRING";
+      pushToken("STRING", decoded);
       continue;
     }
 
@@ -495,7 +590,7 @@ function patchJsSource(code, dict) {
     if (isIdentStart(ch)) {
       const start = i++;
       while (i < n && isIdentPart(code[i])) i++;
-      prevToken = code.slice(start, i);
+      pushToken(code.slice(start, i));
       continue;
     }
 
@@ -503,7 +598,7 @@ function patchJsSource(code, dict) {
     if (ch >= "0" && ch <= "9") {
       i++;
       while (i < n && /[0-9a-zA-Z_.]/.test(code[i])) i++;
-      prevToken = "NUMBER";
+      pushToken("NUMBER");
       continue;
     }
 
@@ -516,12 +611,42 @@ function patchJsSource(code, dict) {
       }
     }
     if (matchedOp) {
-      prevToken = matchedOp;
+      pushToken(matchedOp);
       i += matchedOp.length;
       continue;
     }
 
-    prevToken = ch;
+    // Structural punctuation tracking for object property context
+    if (ch === "{" || ch === "(" || ch === "[") {
+      stack.push({ type: ch, propKey: null, ternaryDepth: 0 });
+    } else if (ch === "}" || ch === ")" || ch === "]") {
+      if (stack.length > 0) stack.pop();
+    } else if (ch === "?") {
+      const sc = currentScope();
+      if (sc) sc.ternaryDepth++;
+    } else if (ch === ":") {
+      const sc = currentScope();
+      if (sc && sc.ternaryDepth > 0) {
+        sc.ternaryDepth--;
+      } else if (sc && sc.type === "{" && (prev2Token === "{" || prev2Token === ",")) {
+        if (prevToken === "STRING" && prevStringVal !== null) {
+          sc.propKey = prevStringVal;
+        } else if (prevToken && prevToken !== "NUMBER") {
+          sc.propKey = prevToken;
+        }
+      }
+    } else if (ch === "=") {
+      // Handle class fields like `_tag = "Filter"`
+      const sc = currentScope();
+      if (sc && sc.type === "{" && (prev2Token === "{" || prev2Token === ";") && prevToken) {
+        sc.propKey = prevToken;
+      }
+    } else if (ch === "," || ch === ";") {
+      const sc = currentScope();
+      if (sc && sc.type === "{") sc.propKey = null;
+    }
+
+    pushToken(ch);
     i++;
   }
 
@@ -534,7 +659,6 @@ function patchJsSource(code, dict) {
 
 function shouldPatchClientAsset(fileName) {
   if (!fileName.endsWith(".js")) return false;
-  // Skip large third-party/vendor/syntax-grammar/icon/media chunks
   const skipPrefixes = [
     "heic-to-",
     "katex-",
@@ -629,7 +753,9 @@ function main() {
       origAsar.dataStart + Number(entry.meta.offset) + entry.meta.size,
     );
     let source = origBuf.toString("utf8");
-    const res = patchJsSource(source, dict);
+    const res = patchJsSource(source, dict, {
+      mode: isDesktopMain ? "desktopMain" : "client",
+    });
     let changed = res.replacements > 0;
     source = res.code;
 
