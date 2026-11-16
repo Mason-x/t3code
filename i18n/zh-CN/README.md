@@ -7,8 +7,11 @@
 
 ## 文件说明
 
-- `dict.json`：简体中文词典（`exact` 精确字面量映射 + `patterns` 前缀规则）。
-- `patch-asar.mjs`：纯 Node.js 补丁脚本，采用 JS 词法扫描安全替换 UI 字符串（避开对象属性键、`===`/`!==`/`case` 比较及第三方语法高亮/字体等资源块），同时更新 `index.html`、`app-update.yml` 及 `RELEASES_URL`，并重算 `app.asar` SHA-256 完整性校验信息。
+- `dict.json`：全量简体中文词典（当前收录 **5,039** 条精确 UI 词条 + **411** 条动态插值模板 + 前缀规则）。
+- `patch-asar.mjs`：纯 Node.js 双层补丁器：
+  1. **静态包体词法替换**：安全替换前端 JS chunk 中的 UI 文案及 Electron 主进程 `main.cjs` 菜单 `label:`（严格跳过 Effect `_tag`、枚举比较与代码高亮资源）；
+  2. **运行时 DOM 翻译层（`/zh-cn-i18n.js`）**：自动打包进 `app.asar` 并在 React 挂载前加载，覆盖 React Compiler 提升的独立单词、服务端推送提示、`${...}` 动态插值、相对时间/数量统计及 `placeholder` / `title` / `aria-label` 属性，同时严格排除 `.chat-markdown` 消息正文、输入框编辑器、代码/Diff、终端及 `.font-mono` 路径/命令标识。
+  同时更新 `index.html`、`app-update.yml` 及 `RELEASES_URL`，并重算 `app.asar` SHA-256 完整性校验信息。
 - `repack-appimage.sh`：无 FUSE 依赖的 Type-2 AppImage 解包/重打包脚本（同时生成 `electron-updater` 所需的 `latest-linux.yml` / `nightly-linux.yml`）。
 - `install-local.sh`：本机一键应用补丁、还原备份或从 Fork Releases 下载安装。
 - `../../.github/workflows/zh-cn-release.yml`：每 6 小时自动同步上游并检查新 Release，自动打包发布中文版到 `Mason-x/t3code` Releases。

@@ -3,8 +3,13 @@
  * Patches T3 Code's resources/app.asar and resources/app-update.yml for Simplified Chinese (zh-CN)
  * and redirects electron-updater to the forked GitHub repository.
  *
- * Pure Node.js implementation (no external npm dependencies). Preserves unpacked flags,
- * symlinks, file permissions, and recomputes ASAR SHA-256 integrity metadata.
+ * Hybrid 2-Layer Architecture:
+ *  1. Static AST/Lexer bundle patching: safely translates unambiguous UI string literals in client JS
+ *     chunks and `label:` menu entries in Electron `main.cjs` (strictly guarding Effect `_tag`s & enums).
+ *  2. Scoped Runtime DOM Translator (`/zh-cn-i18n.js` packed into `app.asar` and loaded before React):
+ *     translates React-Compiler hoisted words, server-sent provider messages, dynamic `${...}` templates,
+ *     relative timestamps, and `placeholder`/`title`/`aria-label` attributes, while strictly excluding
+ *     `.chat-markdown`, composer editor, code/diffs, terminals, and `.font-mono` identifiers.
  */
 
 import crypto from "node:crypto";
@@ -77,8 +82,37 @@ function computeIntegrity(buffer, blockSize = 4194304) {
   };
 }
 
-function writeAsar(asarPath, origAsar, modifiedFiles) {
+function ensureTreeFileNode(rootTree, relPath) {
+  const segments = relPath.split("/");
+  let curr = rootTree;
+  for (let i = 0; i < segments.length - 1; i++) {
+    const seg = segments[i];
+    if (!curr.files) curr.files = {};
+    if (!curr.files[seg]) curr.files[seg] = { files: {} };
+    curr = curr.files[seg];
+  }
+  const leaf = segments[segments.length - 1];
+  if (!curr.files) curr.files = {};
+  if (!curr.files[leaf]) {
+    curr.files[leaf] = {
+      size: 0,
+      offset: "0",
+      integrity: {
+        algorithm: "SHA256",
+        hash: "",
+        blockSize: 4194304,
+        blocks: [],
+      },
+    };
+  }
+}
+
+function writeAsar(asarPath, origAsar, modifiedFiles, addedPaths = []) {
   const newTree = structuredClone(origAsar.tree);
+  for (const added of addedPaths) {
+    ensureTreeFileNode(newTree, added);
+  }
+
   const chunks = [];
   let currentOffset = 0;
 
@@ -132,6 +166,308 @@ function writeAsar(asarPath, origAsar, modifiedFiles) {
   return outBuf.length;
 }
 
+// ---------- Runtime Scoped DOM Translator generator ----------
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildCompiledTemplates(templatesObj = {}) {
+  const byFirstWord = {};
+  const leadingVar = [];
+
+  for (const [enTpl, zhTpl] of Object.entries(templatesObj)) {
+    if (!enTpl || !zhTpl || enTpl === zhTpl) continue;
+    const stripped = enTpl.replace(/\{\d+\}/g, "").trim();
+    if (stripped.length < 3 || !/[A-Za-z]{2,}/.test(stripped)) continue;
+
+    const tokens = enTpl.split(/(\{\d+\})/g);
+    const order = [];
+    let regexSrc = "^";
+    let longestStatic = "";
+
+    for (let i = 0; i < tokens.length; i++) {
+      const tok = tokens[i];
+      if (!tok) continue;
+      const m = /^\{(\d+)\}$/.exec(tok);
+      if (m) {
+        order.push(Number(m[1]));
+        const isLast = tokens.slice(i + 1).every((t) => t === "");
+        regexSrc += isLast ? "(.+)" : "(.+?)";
+      } else {
+        regexSrc += escapeRegex(tok);
+        if (tok.length > longestStatic.length) longestStatic = tok;
+      }
+    }
+    regexSrc += "$";
+
+    if (order.length === 0) continue;
+
+    const firstToken = tokens[0] || "";
+    const wordMatch = /^([A-Za-z]+)/.exec(firstToken.trimStart());
+    const entry = { r: regexSrc, o: order, z: zhTpl, a: longestStatic };
+
+    if (wordMatch && firstToken === firstToken.trimStart()) {
+      const key = wordMatch[1];
+      if (!byFirstWord[key]) byFirstWord[key] = [];
+      byFirstWord[key].push(entry);
+    } else {
+      if (longestStatic.trim().length >= 3) {
+        leadingVar.push(entry);
+      }
+    }
+  }
+
+  return { byFirstWord, leadingVar };
+}
+
+function generateRuntimeDomScript(dict) {
+  const compiled = buildCompiledTemplates(dict.templates || {});
+  const payload = JSON.stringify({
+    exact: dict.exact || {},
+    prefixes: dict.patterns || [],
+    byFirstWord: compiled.byFirstWord,
+    leadingVar: compiled.leadingVar,
+  });
+
+  return `(() => {
+  "use strict";
+  if (typeof window === "undefined" || window.__T3CODE_ZH_CN_ACTIVE__) return;
+  window.__T3CODE_ZH_CN_ACTIVE__ = true;
+
+  const DATA = ${payload};
+  const EXACT = DATA.exact;
+  const PREFIXES = DATA.prefixes;
+
+  // Pre-compile template regexes lazily per bucket
+  const WORD_BUCKETS = new Map();
+  for (const [word, list] of Object.entries(DATA.byFirstWord)) {
+    WORD_BUCKETS.set(word, list.map((e) => ({ re: new RegExp(e.r), o: e.o, z: e.z, a: e.a })));
+  }
+  const LEADING_VAR = DATA.leadingVar.map((e) => ({ re: new RegExp(e.r), o: e.o, z: e.z, a: e.a }));
+
+  // Built-in relative time & common count rules
+  const BUILTIN_RULES = [
+    [/^just now$/i, () => "刚刚"],
+    [/^yesterday$/i, () => "昨天"],
+    [/^(\\d+)\\s*s(?:ec(?:ond)?s?)?\\s+ago$/i, (m) => m[1] + " 秒前"],
+    [/^(\\d+)\\s*m(?:in(?:ute)?s?)?\\s+ago$/i, (m) => m[1] + " 分钟前"],
+    [/^(\\d+)\\s*h(?:(?:ou)?rs?)?\\s+ago$/i, (m) => m[1] + " 小时前"],
+    [/^(\\d+)\\s*d(?:ays?)?\\s+ago$/i, (m) => m[1] + " 天前"],
+    [/^(\\d+)\\s*w(?:(?:ee)?ks?)?\\s+ago$/i, (m) => m[1] + " 周前"],
+    [/^(\\d+)\\s*mo(?:nths?)?\\s+ago$/i, (m) => m[1] + " 个月前"],
+    [/^(\\d+)\\s*y(?:(?:ea)?rs?)?\\s+ago$/i, (m) => m[1] + " 年前"],
+    [/^(\\d+)\\s+files?\\s+changed$/i, (m) => m[1] + " 个文件已更改"],
+    [/^(\\d+)\\s+files?$/i, (m) => m[1] + " 个文件"],
+    [/^(\\d+)\\s+folders?$/i, (m) => m[1] + " 个文件夹"],
+    [/^(\\d+)\\s+projects?$/i, (m) => m[1] + " 个项目"],
+    [/^(\\d+)\\s+threads?$/i, (m) => m[1] + " 个 Threads"],
+    [/^(\\d+)\\s+commits?$/i, (m) => m[1] + " 个 Commits"],
+    [/^(\\d+)\\s+branches$/i, (m) => m[1] + " 个 Branches"],
+    [/^(\\d+)\\s+changes?$/i, (m) => m[1] + " 处变更"],
+    [/^(\\d+)\\s+selected$/i, (m) => "已选 " + m[1] + " 项"],
+    [/^(\\d+)\\s+results?$/i, (m) => m[1] + " 条结果"],
+    [/^(\\d+)\\s+items?$/i, (m) => m[1] + " 项"],
+    [/^(\\d+)\\s+warnings?$/i, (m) => m[1] + " 个警告"],
+    [/^(\\d+)\\s+errors?$/i, (m) => m[1] + " 个错误"],
+  ];
+
+  const EXCLUDE_SELECTOR =
+    ".chat-markdown, [data-testid='composer-editor'], [contenteditable='true'], .ProseMirror, pre, code, kbd, samp, script, style, textarea, svg, .shiki, .xterm, .cm-editor, .monaco-editor, [data-diff-file-key], .font-mono";
+
+  const excludedCache = new WeakMap();
+  const seenText = new WeakMap();
+
+  function isExcludedElement(el) {
+    if (!el || el.nodeType !== 1) return true;
+    const cached = excludedCache.get(el);
+    if (cached !== undefined) return cached;
+    const hit = el.closest(EXCLUDE_SELECTOR) !== null;
+    excludedCache.set(el, hit);
+    return hit;
+  }
+
+  function applyTemplate(entry, core) {
+    if (entry.a && !core.includes(entry.a)) return null;
+    const m = entry.re.exec(core);
+    if (!m) return null;
+    const vals = {};
+    for (let i = 0; i < entry.o.length; i++) {
+      const rawCap = m[i + 1];
+      const trimmedCap = rawCap.trim();
+      vals[entry.o[i]] = Object.prototype.hasOwnProperty.call(EXACT, trimmedCap)
+        ? rawCap.replace(trimmedCap, EXACT[trimmedCap])
+        : rawCap;
+    }
+    return entry.z.replace(/\\{(\\d+)\\}/g, (_, k) => (vals[k] !== undefined ? vals[k] : ""));
+  }
+
+  function translateCore(core) {
+    if (Object.prototype.hasOwnProperty.call(EXACT, core)) {
+      return EXACT[core];
+    }
+
+    // Punctuation wrappers (trailing colon / ellipsis / period, leading bullet)
+    if (core.startsWith("· ")) {
+      const rest = core.slice(2).trim();
+      if (Object.prototype.hasOwnProperty.call(EXACT, rest)) return "· " + EXACT[rest];
+    }
+    for (const [enSuf, zhSuf] of [[":", "："], ["...", "..."], ["…", "…"]]) {
+      if (core.endsWith(enSuf)) {
+        const stem = core.slice(0, -enSuf.length).trimEnd();
+        if (Object.prototype.hasOwnProperty.call(EXACT, stem)) {
+          return EXACT[stem] + zhSuf;
+        }
+      }
+    }
+
+    // Built-in count/time rules
+    for (let i = 0; i < BUILTIN_RULES.length; i++) {
+      const m = BUILTIN_RULES[i][0].exec(core);
+      if (m) return BUILTIN_RULES[i][1](m);
+    }
+
+    // Prefix rules
+    for (let i = 0; i < PREFIXES.length; i++) {
+      const p = PREFIXES[i];
+      if (p.prefix && core.startsWith(p.prefix)) {
+        const tail = core.slice(p.prefix.length);
+        const trTail = Object.prototype.hasOwnProperty.call(EXACT, tail) ? EXACT[tail] : tail;
+        return p.zhPrefix + trTail;
+      }
+    }
+
+    // Word-bucketed dynamic templates
+    const wm = /^([A-Za-z]+)/.exec(core);
+    if (wm) {
+      const bucket = WORD_BUCKETS.get(wm[1]);
+      if (bucket) {
+        for (let i = 0; i < bucket.length; i++) {
+          const out = applyTemplate(bucket[i], core);
+          if (out !== null) return out;
+        }
+      }
+    }
+
+    // Leading-placeholder dynamic templates
+    for (let i = 0; i < LEADING_VAR.length; i++) {
+      const out = applyTemplate(LEADING_VAR[i], core);
+      if (out !== null) return out;
+    }
+
+    return null;
+  }
+
+  function translateString(raw) {
+    if (!raw || raw.length > 260) return null;
+    if (!/[A-Za-z]/.test(raw)) return null;
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const translated = translateCore(trimmed);
+    if (!translated || translated === trimmed) return null;
+    const startIdx = raw.indexOf(trimmed);
+    const leading = raw.slice(0, startIdx);
+    const trailing = raw.slice(startIdx + trimmed.length);
+    return leading + translated + trailing;
+  }
+
+  function processTextNode(node) {
+    const val = node.nodeValue;
+    if (!val || seenText.get(node) === val) return;
+    const parent = node.parentElement;
+    if (!parent || isExcludedElement(parent)) {
+      seenText.set(node, val);
+      return;
+    }
+    const next = translateString(val);
+    if (next !== null && next !== val) {
+      seenText.set(node, next);
+      node.nodeValue = next;
+    } else {
+      seenText.set(node, val);
+    }
+  }
+
+  const UI_ATTRS = ["placeholder", "title", "aria-label"];
+
+  function processElementAttrs(el) {
+    if (!el || el.nodeType !== 1) return;
+    const tag = el.tagName;
+    if (tag === "SCRIPT" || tag === "STYLE" || tag === "SVG" || tag === "PATH") return;
+    // Allow placeholder/aria-label/title on inputs even when input has font-mono
+    const inChatOrCode = el.closest(".chat-markdown, pre, code, .shiki, .xterm") !== null;
+    if (inChatOrCode) return;
+    for (let i = 0; i < UI_ATTRS.length; i++) {
+      const attr = UI_ATTRS[i];
+      const v = el.getAttribute(attr);
+      if (v) {
+        const next = translateString(v);
+        if (next !== null && next !== v) {
+          el.setAttribute(attr, next);
+        }
+      }
+    }
+  }
+
+  function scanSubtree(root) {
+    if (!root) return;
+    if (root.nodeType === 3) {
+      processTextNode(root);
+      return;
+    }
+    if (root.nodeType !== 1) return;
+    processElementAttrs(root);
+    if (isExcludedElement(root)) return;
+
+    const elems = root.querySelectorAll("[placeholder],[title],[aria-label]");
+    for (let i = 0; i < elems.length; i++) processElementAttrs(elems[i]);
+
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = walker.nextNode())) {
+      processTextNode(n);
+    }
+  }
+
+  const observer = new MutationObserver((mutations) => {
+    for (let i = 0; i < mutations.length; i++) {
+      const m = mutations[i];
+      if (m.type === "characterData") {
+        processTextNode(m.target);
+      } else if (m.type === "attributes") {
+        processElementAttrs(m.target);
+      } else if (m.type === "childList") {
+        if (m.target.nodeType === 1 && isExcludedElement(m.target)) continue;
+        const added = m.addedNodes;
+        for (let j = 0; j < added.length; j++) {
+          scanSubtree(added[j]);
+        }
+      }
+    }
+  });
+
+  function start() {
+    const target = document.documentElement;
+    if (!target) return;
+    scanSubtree(document.body || target);
+    observer.observe(target, {
+      subtree: true,
+      childList: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: UI_ATTRS,
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start, { once: true });
+  } else {
+    start();
+  }
+})();
+`;
+}
+
 // ---------- Safe JS string literal translator ----------
 
 const REGEX_PRECEDING_KEYWORDS = new Set([
@@ -175,7 +511,6 @@ const REGEX_PRECEDING_PUNCT = new Set([
   "=>",
 ]);
 
-// Property / class-field names that hold runtime discriminators or protocol IDs (NEVER translate)
 const BLOCKED_PROP_KEYS = new Set([
   "_tag",
   "_op",
@@ -209,7 +544,6 @@ const BLOCKED_PROP_KEYS = new Set([
   "className",
 ]);
 
-// Property names that explicitly carry human-facing UI text
 const UI_PROP_KEYS = new Set([
   "children",
   "title",
@@ -374,8 +708,6 @@ function patchJsSource(code, dict, options = { mode: "client" }) {
   let prevStringVal = null;
   let prev2StringVal = null;
 
-  // Track brace/paren/bracket nesting and current object property key per `{` scope
-  // stack items: { type: '{'|'('|'[', propKey: string|null, ternaryDepth: number }
   const stack = [];
 
   const currentScope = () => (stack.length > 0 ? stack[stack.length - 1] : null);
@@ -420,7 +752,6 @@ function patchJsSource(code, dict, options = { mode: "client" }) {
     const propKey = currentPropKey();
 
     if (options.mode === "desktopMain") {
-      // In main.cjs only touch explicit Electron menu labels
       return propKey === "label";
     }
 
@@ -428,8 +759,8 @@ function patchJsSource(code, dict, options = { mode: "client" }) {
       return false;
     }
 
-    // Single-word tokens (no spaces) are prone to colliding with Effect ADT tags,
-    // log levels, or internal enum names. Require explicit UI property context or /settings route map.
+    // Single-word tokens in static JS patching require explicit UI prop context;
+    // any hoisted single-word UI labels are safely handled at render time by /zh-cn-i18n.js.
     const isSingleWord = !/\s/.test(decoded);
     if (isSingleWord) {
       const inUiProp = propKey !== null && (UI_PROP_KEYS.has(propKey) || propKey.startsWith("/settings"));
@@ -442,13 +773,11 @@ function patchJsSource(code, dict, options = { mode: "client" }) {
   while (i < n) {
     const ch = code[i];
 
-    // Whitespace
     if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
       i++;
       continue;
     }
 
-    // Comments
     if (ch === "/" && code[i + 1] === "/") {
       i += 2;
       while (i < n && code[i] !== "\n") i++;
@@ -461,7 +790,6 @@ function patchJsSource(code, dict, options = { mode: "client" }) {
       continue;
     }
 
-    // Regex literal vs division
     if (
       ch === "/" &&
       (prevToken === "" || REGEX_PRECEDING_PUNCT.has(prevToken) || REGEX_PRECEDING_KEYWORDS.has(prevToken))
@@ -470,38 +798,28 @@ function patchJsSource(code, dict, options = { mode: "client" }) {
       let inClass = false;
       while (i < n) {
         const rc = code[i++];
-        if (rc === "\\") {
-          i++;
-        } else if (rc === "[") {
-          inClass = true;
-        } else if (rc === "]" && inClass) {
-          inClass = false;
-        } else if (rc === "/" && !inClass) {
-          break;
-        } else if (rc === "\n") {
-          break;
-        }
+        if (rc === "\\") i++;
+        else if (rc === "[") inClass = true;
+        else if (rc === "]" && inClass) inClass = false;
+        else if (rc === "/" && !inClass) break;
+        else if (rc === "\n") break;
       }
       while (i < n && isIdentPart(code[i])) i++;
       pushToken("/");
       continue;
     }
 
-    // Quoted strings: "..." or '...'
     if (ch === '"' || ch === "'") {
       const start = i;
       const quote = ch;
       i++;
       while (i < n) {
         const sc = code[i];
-        if (sc === "\\") {
-          i += 2;
-        } else if (sc === quote) {
+        if (sc === "\\") i += 2;
+        else if (sc === quote) {
           i++;
           break;
-        } else {
-          i++;
-        }
+        } else i++;
       }
       const raw = code.slice(start + 1, i - 1);
       const decoded = unescapeJsString(raw, quote);
@@ -521,7 +839,6 @@ function patchJsSource(code, dict, options = { mode: "client" }) {
       continue;
     }
 
-    // Template literals: `...`
     if (ch === "`") {
       const start = i;
       i++;
@@ -529,9 +846,8 @@ function patchJsSource(code, dict, options = { mode: "client" }) {
       let depth = 0;
       while (i < n) {
         const tc = code[i];
-        if (tc === "\\") {
-          i += 2;
-        } else if (tc === "$" && code[i + 1] === "{") {
+        if (tc === "\\") i += 2;
+        else if (tc === "$" && code[i + 1] === "{") {
           hasInterpolation = true;
           i += 2;
           depth = 1;
@@ -554,16 +870,12 @@ function patchJsSource(code, dict, options = { mode: "client" }) {
             } else if (ic === "}") {
               depth--;
               i++;
-            } else {
-              i++;
-            }
+            } else i++;
           }
         } else if (tc === "`") {
           i++;
           break;
-        } else {
-          i++;
-        }
+        } else i++;
       }
       let decoded = null;
       if (!hasInterpolation) {
@@ -586,7 +898,6 @@ function patchJsSource(code, dict, options = { mode: "client" }) {
       continue;
     }
 
-    // Identifiers / keywords
     if (isIdentStart(ch)) {
       const start = i++;
       while (i < n && isIdentPart(code[i])) i++;
@@ -594,7 +905,6 @@ function patchJsSource(code, dict, options = { mode: "client" }) {
       continue;
     }
 
-    // Numbers
     if (ch >= "0" && ch <= "9") {
       i++;
       while (i < n && /[0-9a-zA-Z_.]/.test(code[i])) i++;
@@ -602,7 +912,6 @@ function patchJsSource(code, dict, options = { mode: "client" }) {
       continue;
     }
 
-    // Multi-char operators
     let matchedOp = null;
     for (const op of ["===", "!==", "==", "!=", "=>", "++", "--", "&&", "||", "??", "<=", ">="]) {
       if (code.startsWith(op, i)) {
@@ -616,7 +925,6 @@ function patchJsSource(code, dict, options = { mode: "client" }) {
       continue;
     }
 
-    // Structural punctuation tracking for object property context
     if (ch === "{" || ch === "(" || ch === "[") {
       stack.push({ type: ch, propKey: null, ternaryDepth: 0 });
     } else if (ch === "}" || ch === ")" || ch === "]") {
@@ -636,7 +944,6 @@ function patchJsSource(code, dict, options = { mode: "client" }) {
         }
       }
     } else if (ch === "=") {
-      // Handle class fields like `_tag = "Filter"`
       const sc = currentScope();
       if (sc && sc.type === "{" && (prev2Token === "{" || prev2Token === ";") && prevToken) {
         sc.propKey = prevToken;
@@ -720,6 +1027,13 @@ function main() {
   const origAsar = readAsar(asarPath);
   const allEntries = collectFilesFromTree(origAsar.tree, "");
   const modifiedFiles = new Map();
+  const addedPaths = [];
+
+  // Build and inject /zh-cn-i18n.js into apps/server/dist/client/zh-cn-i18n.js
+  const runtimeRelPath = "apps/server/dist/client/zh-cn-i18n.js";
+  const runtimeScriptBuf = Buffer.from(generateRuntimeDomScript(dict), "utf8");
+  modifiedFiles.set(runtimeRelPath, runtimeScriptBuf);
+  addedPaths.push(runtimeRelPath);
 
   let totalReplacements = 0;
   let patchedJsFiles = 0;
@@ -733,11 +1047,15 @@ function main() {
         origAsar.dataStart + Number(entry.meta.offset),
         origAsar.dataStart + Number(entry.meta.offset) + entry.meta.size,
       );
-      const html = origBuf.toString("utf8");
-      const patchedHtml = html.replace('<html lang="en">', '<html lang="zh-CN">');
-      if (patchedHtml !== html) {
-        modifiedFiles.set(rel, Buffer.from(patchedHtml, "utf8"));
+      let html = origBuf.toString("utf8");
+      html = html.replace('<html lang="en">', '<html lang="zh-CN">');
+      if (!html.includes('/zh-cn-i18n.js')) {
+        html = html.replace(
+          /<script\s+type="module"/,
+          '<script src="/zh-cn-i18n.js"></script>\n    <script type="module"',
+        );
       }
+      modifiedFiles.set(rel, Buffer.from(html, "utf8"));
       continue;
     }
 
@@ -780,13 +1098,13 @@ function main() {
   const ymlChanged = patchAppUpdateYml(appUpdatePath, args.owner, args.repo, args.dryRun);
 
   if (!args.dryRun) {
-    const newAsarSize = writeAsar(asarPath, origAsar, modifiedFiles);
+    const newAsarSize = writeAsar(asarPath, origAsar, modifiedFiles, addedPaths);
     console.log(
-      `Patched ${asarPath}: ${patchedJsFiles} JS files, ${totalReplacements} string replacements, ${modifiedFiles.size} total ASAR entries updated, app-update.yml=${ymlChanged ? "updated" : "unchanged"} (owner=${args.owner}, repo=${args.repo}), new ASAR size=${newAsarSize}`,
+      `Patched ${asarPath}: ${patchedJsFiles} JS files (${totalReplacements} static replacements) + runtime DOM i18n (${runtimeScriptBuf.length} bytes), ${modifiedFiles.size} ASAR entries updated, app-update.yml=${ymlChanged ? "updated" : "unchanged"} (owner=${args.owner}, repo=${args.repo}), new ASAR size=${newAsarSize}`,
     );
   } else {
     console.log(
-      `[dry-run] Would patch ${patchedJsFiles} JS files, ${totalReplacements} string replacements, ${modifiedFiles.size} total ASAR entries, app-update.yml=${ymlChanged}`,
+      `[dry-run] Would patch ${patchedJsFiles} JS files (${totalReplacements} static replacements) + runtime DOM i18n (${runtimeScriptBuf.length} bytes)`,
     );
   }
 }
