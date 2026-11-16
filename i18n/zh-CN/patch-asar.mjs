@@ -274,6 +274,9 @@ function generateRuntimeDomScript(dict) {
 
   const EXCLUDE_SELECTOR =
     ".chat-markdown, [data-testid='composer-editor'], [contenteditable='true'], .ProseMirror, pre, code, kbd, samp, script, style, textarea, svg, .shiki, .xterm, .cm-editor, .monaco-editor, [data-diff-file-key], .font-mono";
+  const NON_MONO_EXCLUDE_SELECTOR =
+    ".chat-markdown, [data-testid='composer-editor'], [contenteditable='true'], .ProseMirror, pre, code, kbd, samp, script, style, textarea, svg, .shiki, .xterm, .cm-editor, .monaco-editor, [data-diff-file-key]";
+  const MONO_ALLOW = new Set(["Always", "Unassigned"]);
 
   const excludedCache = new WeakMap();
   const seenText = new WeakMap();
@@ -371,13 +374,19 @@ function generateRuntimeDomScript(dict) {
     return leading + translated + trailing;
   }
 
+  window.__T3_ZH_TR__ = (s) => (typeof s === "string" ? translateCore(s) || s : s);
+
   function processTextNode(node) {
     const val = node.nodeValue;
     if (!val || seenText.get(node) === val) return;
     const parent = node.parentElement;
-    if (!parent || isExcludedElement(parent)) {
-      seenText.set(node, val);
-      return;
+    if (!parent) return;
+    if (isExcludedElement(parent)) {
+      const trimmed = val.trim();
+      if (!MONO_ALLOW.has(trimmed) || parent.closest(NON_MONO_EXCLUDE_SELECTOR) !== null) {
+        seenText.set(node, val);
+        return;
+      }
     }
     const next = translateString(val);
     if (next !== null && next !== val) {
@@ -1084,6 +1093,17 @@ function main() {
       );
       if (replacedUrl !== source) {
         source = replacedUrl;
+        changed = true;
+      }
+    } else if (path.basename(rel).startsWith("KeybindingsSettings.logic-")) {
+      // Also translate dynamically assembled commandLabel(`Sidebar: Toggle`, `Run Script: ...`, etc.)
+      // in JS memory so both Chinese & English queries match in Keybindings search and Settings search.
+      const hooked = source.replace(
+        /([A-Za-z0-9_$]+\.split\([`"']\.[`"']\)\.map\([A-Za-z0-9_$]+\)\.join\([`"']: [`"']\))/,
+        "(globalThis.__T3_ZH_TR__?globalThis.__T3_ZH_TR__($1):$1)",
+      );
+      if (hooked !== source) {
+        source = hooked;
         changed = true;
       }
     }
