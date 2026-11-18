@@ -7,7 +7,7 @@
 
 ## 文件说明
 
-- `dict.json`：全量简体中文词典（当前收录 **5,039** 条精确 UI 词条 + **411** 条动态插值模板 + 前缀规则）。
+- `dict.json`：全量简体中文词典（当前收录 **5,314** 条精确 UI 词条 + **506** 条动态插值模板 + 前缀规则）。
 - `patch-asar.mjs`：纯 Node.js 双层补丁器：
   1. **静态包体词法替换**：安全替换前端 JS chunk 中的 UI 文案及 Electron 主进程 `main.cjs` 菜单 `label:`（严格跳过 Effect `_tag`、枚举比较与代码高亮资源）；
   2. **运行时 DOM 翻译层（`/zh-cn-i18n.js`）**：自动打包进 `app.asar` 并在 React 挂载前加载，覆盖 React Compiler 提升的独立单词、服务端推送提示、`${...}` 动态插值、相对时间/数量统计及 `placeholder` / `title` / `aria-label` 属性，同时严格排除 `.chat-markdown` 消息正文、输入框编辑器、代码/Diff、终端及 `.font-mono` 路径/命令标识。

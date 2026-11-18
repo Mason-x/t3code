@@ -305,7 +305,27 @@ function generateRuntimeDomScript(dict) {
     return entry.z.replace(/\\{(\\d+)\\}/g, (_, k) => (vals[k] !== undefined ? vals[k] : ""));
   }
 
-  function translateCore(core) {
+  function applyTemplates(core, requireDot) {
+    const wm = /^([A-Za-z]+)/.exec(core);
+    if (wm) {
+      const bucket = WORD_BUCKETS.get(wm[1]);
+      if (bucket) {
+        for (let i = 0; i < bucket.length; i++) {
+          if (requireDot && !bucket[i].a.includes(" · ")) continue;
+          const out = applyTemplate(bucket[i], core);
+          if (out !== null) return out;
+        }
+      }
+    }
+    for (let i = 0; i < LEADING_VAR.length; i++) {
+      if (requireDot && !LEADING_VAR[i].a.includes(" · ")) continue;
+      const out = applyTemplate(LEADING_VAR[i], core);
+      if (out !== null) return out;
+    }
+    return null;
+  }
+
+  function translateCore(core, depth = 0) {
     if (Object.prototype.hasOwnProperty.call(EXACT, core)) {
       return EXACT[core];
     }
@@ -340,25 +360,47 @@ function generateRuntimeDomScript(dict) {
       }
     }
 
-    // Word-bucketed dynamic templates
-    const wm = /^([A-Za-z]+)/.exec(core);
-    if (wm) {
-      const bucket = WORD_BUCKETS.get(wm[1]);
-      if (bucket) {
-        for (let i = 0; i < bucket.length; i++) {
-          const out = applyTemplate(bucket[i], core);
-          if (out !== null) return out;
-        }
+    // Multi-line tooltips & middle-dot metadata lists: match dot-aware templates first,
+    // then translate each segment independently before falling back to greedy templates.
+    if (depth === 0 && core.includes("\\n")) {
+      const lines = core.split("\\n");
+      if (lines.length >= 2 && lines.length <= 8) {
+        let changed = false;
+        const nextLines = lines.map((line) => {
+          const trimmed = line.trim();
+          if (!trimmed) return line;
+          const tr = translateCore(trimmed, 1);
+          if (tr && tr !== trimmed) {
+            changed = true;
+            return line.replace(trimmed, tr);
+          }
+          return line;
+        });
+        if (changed) return nextLines.join("\\n");
       }
     }
 
-    // Leading-placeholder dynamic templates
-    for (let i = 0; i < LEADING_VAR.length; i++) {
-      const out = applyTemplate(LEADING_VAR[i], core);
-      if (out !== null) return out;
+    if (depth === 0 && core.includes(" · ")) {
+      const dotTpl = applyTemplates(core, true);
+      if (dotTpl !== null) return dotTpl;
+      const segs = core.split(" · ");
+      if (segs.length >= 2 && segs.length <= 8) {
+        let changed = false;
+        const nextSegs = segs.map((seg) => {
+          const trimmed = seg.trim();
+          if (!trimmed) return seg;
+          const tr = translateCore(trimmed, 1);
+          if (tr && tr !== trimmed) {
+            changed = true;
+            return tr;
+          }
+          return seg;
+        });
+        if (changed) return nextSegs.join(" · ");
+      }
     }
 
-    return null;
+    return applyTemplates(core, false);
   }
 
   function translateString(raw) {
